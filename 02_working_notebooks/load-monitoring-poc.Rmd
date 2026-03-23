@@ -1,0 +1,693 @@
+# Integrated Load Monitoring Proof of Concept
+
+This is a Bayesian Proof-of-Concept for Injury Risk Reduction and Performance Optimisation in Elite Football
+
+Claude Opus 4.6 was used to aid routine coding tasks. 
+
+```{r, echo = FALSE, message = FALSE, warning=FALSE} 
+# Loading required plots 
+require(brms)        # Bayesian regression models via Stan
+require(ggplot2)     # Visualisation
+require(dplyr)       # Data wrangling
+require(tidyr)       # Reshaping
+require(tidybayes)   # Tidy extraction of posterior draws
+require(patchwork)   # Combining plots
+
+set.seed(2026)  # Reproducibility
+```
+
+## Part 1 - Generating and Visualing synthetic data for training and matches
+
+Simulate 25 players in different positions across 38 match weeks. Each player has daily training data (MD-5 to MD-1) plus match-day data.
+
+This mirrors the microcycle structure described in Morgans et al. (2025):
+- MD-5: compensation/recovery
+- MD-4: strength & power, explosive actions
+- MD-3: tactical, high-intensity, position-specific
+- MD-2: low-intensity technical-tactical ("underloaded")
+- MD-1: neural stimulation, set-plays
+
+External load: total distance (m/min), HSR distance (m/min), sprint distance (m/min), accelerations (n/min)
+
+Internal load: sRPE (RPE × session duration), wellness score (1–10)
+
+```{r}
+
+
+# Squad structure 
+positions <- c(
+  rep("CB", 5), rep("FB", 5), rep("CM", 5),
+  rep("AM", 5), rep("CF", 5)
+)
+n_players <- length(positions)
+player_ids <- paste0("P", sprintf("%02d", 1:n_players))
+player_names <- paste0(positions, "_", rep(1:5, 5))
+
+player_df <- data.frame(
+  player_id = player_ids,
+  player_name = player_names,
+  position = positions,
+  stringsAsFactors = FALSE
+)
+
+# True positional baselines for TRAINING session external load (m/min)
+pos_td_train  <- c(CB = 95, FB = 105, CM = 110, AM = 105, CF = 98)   # total distance 
+pos_hsr_train <- c(CB = 1.5, FB = 2.5, CM = 2.0, AM = 2.8, CF = 2.2) # HSR m/min
+
+# True positional baselines for MATCH external load (m/min)
+# Higher than training, calibrated to match-play literature
+pos_hsr_match <- c(CB = 3.0, FB = 5.5, CM = 4.5, AM = 6.0, CF = 5.0) # HSR m/min in matches
+
+# Player-specific random effects (individual variation around position mean)
+player_re_hsr <- rnorm(n_players, 0, 0.5)  # SD ~0.5 m/min
+player_re_wellness <- rnorm(n_players, 0, 0.5) # baseline wellness variation
+
+```
+
+```{r}
+# Generate Weekly data
+
+n_weeks <- 38
+all_data <- list()
+
+for (w in 1:n_weeks) {
+  for (p in 1:n_players) {
+    pos <- player_df$position[p]
+
+    # --- Training days (5 sessions: MD-5 to MD-1) ---
+    # Session intensity follows the published microcycle pattern
+    # MD-4 and MD-3 are the highest-load days
+    session_intensity <- c(0.6, 0.95, 0.85, 0.5, 0.3)  # MD-5 to MD-1
+    session_duration  <- c(60, 75, 80, 60, 45)           # minutes
+
+    for (d in 1:5) {
+      # External load: HSR distance per minute
+      hsr <- (pos_hsr_train[pos] + player_re_hsr[p]) *
+        session_intensity[d] +
+        rnorm(1, 0, 0.3)
+      hsr <- max(hsr, 0)
+
+      # Total distance (correlated with HSR but with positional variation)
+      td <- (pos_td_train[pos] + rnorm(1, 0, 5)) *
+        session_intensity[d] * (session_duration[d] / 60)
+
+      # Sprint distance per minute (subset of HSR, lower values)
+      sprint <- hsr * runif(1, 0.15, 0.35)
+
+      # Accelerations per minute
+      accel <- 1.5 * session_intensity[d] + rnorm(1, 0, 0.3)
+
+      # Internal load: RPE (1-10) and session duration → sRPE
+      rpe <- round(pmin(pmax(
+        session_intensity[d] * 7 + rnorm(1, 0, 1), 1), 10), 1)
+      srpe <- rpe * session_duration[d]
+
+      # Wellness score (1-10): influenced by cumulative load and individual
+      # Higher load earlier in week → lower wellness later
+      base_wellness <- 7 + player_re_wellness[p] -
+        0.003 * (w * 5 + d) * session_intensity[d] +  # seasonal fatigue
+        rnorm(1, 0, 0.5)
+      wellness <- round(pmin(pmax(base_wellness, 1), 10), 1)
+
+      all_data[[length(all_data) + 1]] <- data.frame(
+        player_id = player_ids[p],
+        position = pos,
+        week = w,
+        day_type = paste0("MD-", 6 - d),
+        is_match = FALSE,
+        session_duration = session_duration[d],
+        hsr_per_min = round(hsr, 2),
+        td_metres = round(td, 0),
+        sprint_per_min = round(sprint, 3),
+        accel_per_min = round(accel, 2),
+        rpe = rpe,
+        srpe = round(srpe, 0),
+        wellness = wellness,
+        match_hsr = NA_real_,
+        stringsAsFactors = FALSE
+      )
+    }
+
+    # --- Match day ---
+    # Not all players play every week (rotation, injury, tactical choice)
+    plays_match <- runif(1) < 0.7  # ~70% availability per week
+    match_mins <- if (plays_match) sample(c(90, 90, 90, 75, 60), 1) else 0
+
+    if (plays_match) {
+      match_hsr <- pos_hsr_match[pos] + player_re_hsr[p] + rnorm(1, 0, 0.6)
+      match_hsr <- max(match_hsr, 0)
+
+      all_data[[length(all_data) + 1]] <- data.frame(
+        player_id = player_ids[p],
+        position = pos,
+        week = w,
+        day_type = "MD",
+        is_match = TRUE,
+        session_duration = match_mins,
+        hsr_per_min = round(match_hsr, 2),
+        td_metres = round(match_mins * runif(1, 105, 125), 0),
+        sprint_per_min = round(match_hsr * runif(1, 0.2, 0.4), 3),
+        accel_per_min = round(2.0 + rnorm(1, 0, 0.4), 2),
+        rpe = round(pmin(pmax(7.5 + rnorm(1, 0, 1), 4), 10), 1),
+        srpe = NA_real_,
+        wellness = NA_real_,
+        match_hsr = round(match_hsr, 2),
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+}
+
+dat <- bind_rows(all_data)
+cat(sprintf("Simulated %d daily records for %d players across %d weeks\n",
+            nrow(dat), n_players, n_weeks))
+
+
+```
+
+
+```{r}
+# Training Data Summarised
+
+train_summary <- dat %>%
+  filter(!is_match) %>%
+  group_by(position) %>%
+  summarise(
+    n_sessions    = n(),
+    n_players     = n_distinct(player_id),
+    hsr_mean      = round(mean(hsr_per_min, na.rm = TRUE), 2),
+    hsr_sd        = round(sd(hsr_per_min, na.rm = TRUE), 2),
+    sprint_mean   = round(mean(sprint_per_min, na.rm = TRUE), 3),
+    accel_mean    = round(mean(accel_per_min, na.rm = TRUE), 2),
+    srpe_mean     = round(mean(srpe, na.rm = TRUE), 0),
+    wellness_mean = round(mean(wellness, na.rm = TRUE), 1),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(hsr_mean))
+
+print(as.data.frame(train_summary))
+
+
+```
+
+
+```{r}
+# Match data summarised
+
+match_summary <- dat %>%
+  filter(is_match) %>%
+  group_by(position) %>%
+  summarise(
+    n_matches     = n(),
+    n_players     = n_distinct(player_id),
+    match_hsr_mean = round(mean(match_hsr, na.rm = TRUE), 2),
+    match_hsr_sd   = round(sd(match_hsr, na.rm = TRUE), 2),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(match_hsr_mean))
+
+print(as.data.frame(match_summary))
+
+```
+
+## Part 2 — Derive workload features
+
+Key features for modelling:
+- ACWR (Acute:Chronic Workload Ratio) — rolling 7-day / 28-day external load (HSR-based), computed per player
+
+- Weekly sRPE load (sum of daily sRPE across the training week)
+
+- Weekly mean wellness score
+
+- External-internal mismatch: when external load is high but internal response is disproportionately elevated -> risk signal
+
+```{r}
+# Aggregate to weekly level per player
+weekly <- dat %>%
+  filter(!is_match) %>%
+  group_by(player_id, position, week) %>%
+  summarise(
+    weekly_hsr_load = sum(hsr_per_min * session_duration, na.rm = TRUE),
+    weekly_td_load  = sum(td_metres, na.rm = TRUE),
+    weekly_srpe     = sum(srpe, na.rm = TRUE),
+    mean_wellness   = mean(wellness, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Compute rolling acute (1-week) and chronic (4-week exponentially weighted)
+# loads per player, then ACWR
+weekly <- weekly %>%
+  arrange(player_id, week) %>%
+  group_by(player_id) %>%
+  mutate(
+    acute_load  = weekly_hsr_load,
+    chronic_load = zoo::rollmean(weekly_hsr_load, k = 4, fill = NA,
+                                  align = "right"),
+    acwr = ifelse(!is.na(chronic_load) & chronic_load > 0,
+                  acute_load / chronic_load, NA_real_),
+    # Standardise features for modelling
+    z_acwr = as.numeric(scale(acwr)),
+    z_srpe = as.numeric(scale(weekly_srpe)),
+    z_wellness = as.numeric(scale(mean_wellness))
+  ) %>%
+  ungroup()
+
+# External-internal mismatch: residual of sRPE ~ external load regression
+# High positive residual = internal response is elevated relative to
+# external stimulus → possible fatigue/illness signal
+fit_mismatch <- lm(weekly_srpe ~ weekly_hsr_load, data = weekly)
+weekly$ei_mismatch <- as.numeric(scale(residuals(fit_mismatch)))
+
+# Add match-day HSR (the performance outcome) from match records
+match_perf <- dat %>%
+  filter(is_match) %>%
+  select(player_id, week, match_hsr)
+
+weekly <- weekly %>%
+  left_join(match_perf, by = c("player_id", "week"))
+
+```
+
+```{r}
+# Base injury rate ~5-8% per player-week (realistic for EPL squads)
+
+player_vulnerability <- setNames(rnorm(n_players, 0, 0.3), player_ids)
+
+weekly <- weekly %>%
+  filter(!is.na(acwr)) %>%
+  mutate(
+    # Log-odds of injury
+    logit_injury = -3.0 +                                    # base rate ~4.5%
+      0.8 * z_acwr +                                         # ACWR effect
+      -0.4 * z_wellness +                                    # low wellness → higher risk
+      0.3 * ei_mismatch +                                    # mismatch signal
+      player_vulnerability[player_id],                        # individual frailty
+    p_injury = plogis(logit_injury),
+    injured = rbinom(n(), 1, p_injury)
+  )
+
+cat(sprintf("Injury rate: %.1f%% of player-weeks\n",
+            mean(weekly$injured, na.rm = TRUE) * 100))
+cat(sprintf("Modelling dataset: %d player-weeks with complete data\n",
+            sum(complete.cases(weekly[, c("acwr", "weekly_srpe",
+                                          "mean_wellness", "injured")]))))
+```
+
+
+## Part 3 — Model A: Bayesian Hierarchical Logistic Regression (Injury Risk)
+
+This section fits a Bayesian hierarchical logistic regression to model weekly injury probability as a function of each player's current load state. The model specification is:
+
+$$
+\text{injured}_i \sim \text{Bernoulli}(p_i)
+$$
+
+$$
+\text{logit}(p_i) = \beta_0 + \beta_1 \cdot \text{ACWR}_i + \beta_2 \cdot \text{Wellness}_i + \beta_3 \cdot \text{EI\_Mismatch}_i + u_{\text{player}} + v_{\text{position}}
+$$
+
+where $u_{\text{player}} \sim \mathcal{N}(0, \sigma^2_u)$ and $v_{\text{position}} \sim \mathcal{N}(0, \sigma^2_v)$ are random intercepts capturing individual vulnerability and positional baseline risk respectively.
+
+
+```{r fit-injury-model, results="hide", message=FALSE, warning=FALSE}
+
+model_injury <- brm(
+  injured ~ z_acwr + z_wellness + ei_mismatch + (1 | player_id) + (1 | position),
+  data = weekly,
+  family = bernoulli(link = "logit"),
+  prior = c(
+    prior(normal(0, 1), class = "b"),           # weakly informative on fixed effects
+    prior(normal(-3, 1), class = "Intercept"),   # centre on low base rate
+    prior(exponential(2), class = "sd")          # half-normal on group SDs
+  ),
+  chains = 4,
+  iter = 5000,
+  warmup = 1000,
+  seed = 42,
+  cores = 4, 
+  control = list(adapt_delta = 0.95, max_treedepth = 12),
+  silent = 2
+)
+
+# cat("Model A fitted successfully.\n")
+# summary(model_injury)
+```
+
+
+```{r fit-performance-model, results="hide", message=FALSE, warning=FALSE}
+perf_data <- weekly %>%
+  filter(!is.na(match_hsr))
+
+cat(sprintf("\n--- Fitting Model B: Match Performance (n = %d match observations) ---\n",
+            nrow(perf_data)))
+cat("This will take 2-4 minutes...\n")
+
+model_performance <- brm(
+  match_hsr ~ z_acwr + z_srpe + z_wellness + (1 | player_id) + (1 | position),
+  data = perf_data,
+  family = gaussian(),
+  prior = c(
+    prior(normal(0, 1), class = "b"),
+    prior(normal(5, 2), class = "Intercept"),    # centre on ~5 m/min mean
+    prior(exponential(2), class = "sd"),
+    prior(exponential(1), class = "sigma")
+  ),
+  chains = 4,
+  iter = 5000,
+  warmup = 1000,
+  seed = 42,
+  silent = 2
+)
+
+cat("Model B fitted successfully.\n")
+summary(model_performance)
+```
+
+## Part 5 — Decision Dashboard 
+
+This is the deliverable for a Tuesday team meeting:
+
+- Panel 1: Player-level injury risk posteriors for the upcoming week
+- Panel 2: Expected match-day HSR performance posteriors
+- Panel 3: Risk-performance trade-off scatter (the decision quadrant)
+- Panel 4: ACWR "sweet spot" — how injury risk and performance vary across the ACWR spectrum
+
+```{r}
+# Generate predictions for the most recent week 
+
+current_week <- weekly %>%
+  group_by(player_id) %>%
+  slice_max(week, n = 1) %>%
+  ungroup()
+
+# Posterior predicted injury probabilities
+injury_preds <- posterior_epred(model_injury, newdata = current_week)
+
+injury_summary <- data.frame(
+  player_id = current_week$player_id,
+  position = current_week$position,
+  acwr = round(current_week$acwr, 2),
+  wellness = round(current_week$mean_wellness, 1),
+  p_injury_mean = round(colMeans(injury_preds), 3),
+  p_injury_lower = round(apply(injury_preds, 2, quantile, 0.05), 3),
+  p_injury_upper = round(apply(injury_preds, 2, quantile, 0.95), 3)
+)
+
+# Posterior predicted match performance (for players who might play)
+perf_preds <- posterior_epred(model_performance, newdata = current_week,
+                               allow_new_levels = TRUE)
+
+perf_summary <- data.frame(
+  player_id = current_week$player_id,
+  position = current_week$position,
+  hsr_mean = round(colMeans(perf_preds), 2),
+  hsr_lower = round(apply(perf_preds, 2, quantile, 0.1), 2),
+  hsr_upper = round(apply(perf_preds, 2, quantile, 0.9), 2)
+)
+
+# Merge for the decision dashboard
+dashboard <- injury_summary %>%
+  left_join(perf_summary %>% select(player_id, hsr_mean, hsr_lower, hsr_upper),
+            by = "player_id")
+
+```
+
+```{r}
+# --- 5b. PANEL 1: Injury Risk Forest Plot ------------------------------------
+p1 <- dashboard %>%
+  mutate(player_label = paste0(player_id, " (", position, ")")) %>%
+  arrange(p_injury_mean) %>%
+  mutate(player_label = factor(player_label, levels = player_label)) %>%
+  ggplot(aes(x = p_injury_mean, y = player_label, colour = position)) +
+  geom_point(size = 2.5) +
+  geom_errorbarh(aes(xmin = p_injury_lower, xmax = p_injury_upper),
+                 height = 0.3, linewidth = 0.6) +
+  geom_vline(xintercept = 0.10, linetype = "dashed", colour = "red",
+             alpha = 0.6) +
+  scale_x_continuous(labels = scales::percent_format(),
+                     limits = c(0, NA)) +
+  scale_colour_brewer(palette = "Set2") +
+  labs(
+    title = "Posterior Injury Risk — This Week",
+    subtitle = "90% credible intervals | Red line = 10% risk threshold",
+    x = "P(Injury This Week)",
+    y = NULL,
+    colour = "Position"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold", size = 12),
+    legend.position = "bottom"
+  )
+
+print(p1)
+```
+
+```{r}
+p2 <- dashboard %>%
+  mutate(player_label = paste0(player_id, " (", position, ")")) %>%
+  arrange(hsr_mean) %>%
+  mutate(player_label = factor(player_label, levels = player_label)) %>%
+  ggplot(aes(x = hsr_mean, y = player_label, colour = position)) +
+  geom_point(size = 2.5) +
+  geom_errorbarh(aes(xmin = hsr_lower, xmax = hsr_upper),
+                 height = 0.3, linewidth = 0.6) +
+  scale_colour_brewer(palette = "Set2") +
+  labs(
+    title = "Posterior Expected Match HSR (m/min)",
+    subtitle = "80% credible intervals | Higher = more high-speed output expected",
+    x = "Expected HSR (m/min)",
+    y = NULL,
+    colour = "Position"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold", size = 12),
+    legend.position = "bottom"
+  )
+
+print(p2)
+```
+
+```{r}
+
+p3 <- dashboard %>%
+  ggplot(aes(x = p_injury_mean, y = hsr_mean, colour = position)) +
+  geom_point(size = 3, alpha = 0.8) +
+  geom_text(aes(label = player_id), vjust = -0.8, size = 2.5, alpha = 0.7) +
+  geom_vline(xintercept = 0.10, linetype = "dashed", colour = "red",
+             alpha = 0.5) +
+  geom_hline(yintercept = median(dashboard$hsr_mean, na.rm = TRUE),
+             linetype = "dashed", colour = "blue", alpha = 0.5) +
+  # Quadrant labels — positioned relative to axis limits, not data extremes
+  annotate("text", x = 0.02,
+           y = max(dashboard$hsr_mean, na.rm = TRUE) * 0.95,
+           label = "IDEAL\nHigh performance\nLow risk",
+           colour = "darkgreen", size = 3, fontface = "bold", hjust = 0) +
+  annotate("text", x = max(dashboard$p_injury_mean, na.rm = TRUE) * 0.85,
+           y = max(dashboard$hsr_mean, na.rm = TRUE) * 0.95,
+           label = "CAUTION\nHigh performance\nHigh risk",
+           colour = "orange3", size = 3, fontface = "bold", hjust = 0) +
+  annotate("text", x = 0.02,
+           y = min(dashboard$hsr_mean, na.rm = TRUE) * 1.05,
+           label = "MONITOR\nLow performance\nLow risk",
+           colour = "steelblue", size = 3, fontface = "bold", hjust = 0) +
+  annotate("text", x = max(dashboard$p_injury_mean, na.rm = TRUE) * 0.85,
+           y = min(dashboard$hsr_mean, na.rm = TRUE) * 1.05,
+           label = "RED FLAG\nLow performance\nHigh risk",
+           colour = "red3", size = 3, fontface = "bold", hjust = 0) +
+  scale_x_continuous(labels = scales::percent_format(),
+                     expand = expansion(mult = c(0.05, 0.15))) +
+  scale_y_continuous(expand = expansion(mult = c(0.1, 0.1))) +
+  scale_colour_brewer(palette = "Set2") +
+  labs(
+    title = "Panel 3: Risk–Performance Decision Quadrant",
+    subtitle = "Each point = one player's posterior mean this week",
+    x = "P(Injury This Week)",
+    y = "Expected Match HSR (m/min)",
+    colour = "Position"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold", size = 12),
+    legend.position = "bottom"
+  )
+
+print(p3)
+```
+
+```{r}
+
+acwr_grid <- data.frame(
+  z_acwr = seq(-4, 6, length.out = 100),
+  z_srpe = 0,
+  z_wellness = 0,
+  ei_mismatch = 0,
+  player_id = NA,
+  position = NA
+)
+
+# Injury risk across ACWR spectrum (population-level, re_formula = NA)
+injury_acwr <- posterior_epred(
+  model_injury, newdata = acwr_grid, re_formula = NA,
+  allow_new_levels = TRUE
+)
+
+# Performance across ACWR spectrum
+perf_acwr <- posterior_epred(
+  model_performance, newdata = acwr_grid, re_formula = NA,
+  allow_new_levels = TRUE
+)
+
+# Back-transform ACWR z-scores to raw scale for interpretability
+acwr_mean <- mean(weekly$acwr, na.rm = TRUE)
+acwr_sd   <- sd(weekly$acwr, na.rm = TRUE)
+acwr_grid$acwr_raw <- acwr_grid$z_acwr * acwr_sd + acwr_mean
+
+acwr_plot_data <- data.frame(
+  acwr = acwr_grid$acwr_raw,
+  injury_mean = colMeans(injury_acwr),
+  injury_lower = apply(injury_acwr, 2, quantile, 0.1),
+  injury_upper = apply(injury_acwr, 2, quantile, 0.9),
+  perf_mean = colMeans(perf_acwr),
+  perf_lower = apply(perf_acwr, 2, quantile, 0.1),
+  perf_upper = apply(perf_acwr, 2, quantile, 0.9)
+)
+
+# Dual-axis plot: injury risk (left axis) and performance (right axis)
+# Scale performance to fit on same axis
+perf_range <- range(acwr_plot_data$perf_mean)
+inj_range  <- range(acwr_plot_data$injury_mean)
+
+p4 <- ggplot(acwr_plot_data, aes(x = acwr)) +
+  # Injury risk ribbon and line
+  geom_ribbon(aes(ymin = injury_lower, ymax = injury_upper),
+              fill = "red", alpha = 0.15) +
+  geom_line(aes(y = injury_mean, colour = "Injury Risk"),
+            linewidth = 1.2) +
+  # Optimal zone annotation
+  geom_vline(xintercept = c(0.8, 1.3), linetype = "dotted",
+             colour = "grey40", alpha = 0.6) +
+  annotate("rect", xmin = 0.8, xmax = 1.3,
+           ymin = -Inf, ymax = Inf,
+           fill = "green", alpha = 0.05) +
+  annotate("text", x = 1.05, y = max(acwr_plot_data$injury_upper) * 0.9,
+           label = "Sweet\nSpot",
+           colour = "darkgreen", size = 3.5, fontface = "bold") +
+  scale_colour_manual(values = c("Injury Risk" = "red")) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    title = "ACWR Sweet Spot: Injury Risk vs Workload",
+    subtitle = "Population-level posterior | Green zone: ACWR 0.8–1.3 (Tiernan etpal.)",
+    x = "Acute:Chronic Workload Ratio (ACWR)",
+    y = "P(Injury)",
+    colour = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold", size = 12),
+    legend.position = "bottom"
+  )
+
+print(p4)
+```
+
+
+
+```{r}
+# --- What-if scenario: heavy week impact across 4 player profiles ---
+
+# Define 4 contrasting scenarios with narrative context
+scenarios_list <- list(
+  list(
+    player_id = "P01", position = "CB",
+    label = "P01 (CB) — High chronic base, consistent starter",
+    # Already well-conditioned; heavy week is a smaller relative spike
+    z_acwr_heavy = 1.5, z_srpe_heavy = 1.2,
+    z_wellness_heavy = -0.5, ei_mismatch_heavy = 0.5
+  ),
+  list(
+    player_id = "P16", position = "AM",
+    label = "P16 (AM) — Underloaded, thrown in due to injury crisis",
+    # Low chronic base means even moderate acute load creates a huge ACWR spike
+    z_acwr_heavy = 3.0, z_srpe_heavy = 2.5,
+    z_wellness_heavy = -2.0, ei_mismatch_heavy = 2.0
+  ),
+  list(
+    player_id = "P06", position = "FB",
+    label = "P06 (FB) — Mid-season fatigue, congested fixtures",
+    # Moderate spike on top of accumulated seasonal load
+    z_acwr_heavy = 2.0, z_srpe_heavy = 1.8,
+    z_wellness_heavy = -1.5, ei_mismatch_heavy = 1.0
+  ),
+  list(
+    player_id = "P22", position = "CF",
+    label = "P22 (CF) — Returning from minor knock, ramping back up",
+    # Returning player has low chronic base, moderate acute push
+    z_acwr_heavy = 2.5, z_srpe_heavy = 2.0,
+    z_wellness_heavy = -1.0, ei_mismatch_heavy = 1.5
+  )
+)
+
+# Build scenario dataframes
+all_scenarios <- list()
+
+for (s in scenarios_list) {
+  baseline <- current_week %>% filter(player_id == s$player_id)
+  
+  heavy <- baseline %>%
+    mutate(
+      z_acwr = s$z_acwr_heavy,
+      z_srpe = s$z_srpe_heavy,
+      z_wellness = s$z_wellness_heavy,
+      ei_mismatch = s$ei_mismatch_heavy
+    )
+  
+  # Posterior draws for both
+  preds <- posterior_epred(model_injury,
+                           newdata = bind_rows(baseline, heavy))
+  
+  draws <- data.frame(
+    current = preds[, 1],
+    heavy = preds[, 2]
+  ) %>%
+    pivot_longer(everything(),
+                 names_to = "scenario",
+                 values_to = "p_injury") %>%
+    mutate(
+      scenario = ifelse(scenario == "current",
+                        "Current Week", "After Heavy Week"),
+      scenario = factor(scenario,
+                        levels = c("Current Week", "After Heavy Week")),
+      player_label = s$label
+    )
+  
+  all_scenarios[[length(all_scenarios) + 1]] <- draws
+}
+
+scenario_draws <- bind_rows(all_scenarios)
+
+# Plot: faceted density comparison
+ggplot(scenario_draws, aes(x = p_injury, fill = scenario)) +
+  geom_density(alpha = 0.55, colour = NA) +
+  geom_vline(xintercept = 0.10, linetype = "dashed",
+             colour = "red", alpha = 0.6) +
+  facet_wrap(~ player_label, ncol = 2, scales = "free_y") +
+  scale_x_continuous(labels = scales::percent_format(),
+                     limits = c(0, 1)) +
+  scale_fill_manual(values = c("Current Week" = "steelblue",
+                                "After Heavy Week" = "firebrick")) +
+  labs(
+    title = "What-If Scenarios: How Does a Heavy Week Shift Injury Risk?",
+    subtitle = "Posterior density of P(Injury) under current vs. heavy load | Red line = 10% threshold",
+    x = "P(Injury This Week)",
+    y = "Posterior Density",
+    fill = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold", size = 13),
+    strip.text = element_text(face = "bold", size = 9),
+    legend.position = "bottom"
+  )
+```
